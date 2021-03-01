@@ -7,8 +7,8 @@ use SilverStripe\GraphQL\Middleware\QueryMiddleware;
 
 class DummyResponseMiddleware implements QueryMiddleware
 {
-    public function process(Schema $schema, $query, $context, $params, callable $next)
+    public function process(Schema $schema, $query, $context, $vars, callable $next)
     {
-        return ['result' => "It was me, {$params['name']}!"];
+        return "It was me, {$vars['name']}!";
     }
 }

@@ -2,39 +2,46 @@
 
 namespace SilverStripe\GraphQL\Tests\Middleware;
 
+use GraphQL\Type\Definition\ObjectType;
+use GraphQL\Type\Definition\Type;
+use GraphQL\Type\Schema;
 use SilverStripe\Dev\SapphireTest;
-use SilverStripe\GraphQL\Manager;
-use SilverStripe\GraphQL\Tests\Fake\MutationCreatorFake;
-use SilverStripe\GraphQL\Tests\Fake\QueryCreatorFake;
-use SilverStripe\GraphQL\Tests\Fake\TypeCreatorFake;
+use SilverStripe\GraphQL\QueryHandler\QueryHandler;
 
 class QueryMiddlewareTest extends SapphireTest
 {
     public function testMiddlewareResponse()
     {
-        $config = [
-            'types' => [
-                'mytype' => TypeCreatorFake::class,
-            ],
-            'queries' => [
-                'myquery' => QueryCreatorFake::class,
-            ],
-            'mutations' => [
-                'mymutation' => MutationCreatorFake::class,
-            ],
-        ];
+        // Set up a minimal schema that passes validation.
+        $queryType = new ObjectType([
+            'name' => 'Query',
+            'fields' => [
+                'myQuery' => [
+                    'type' => Type::string(),
+                    'args' => [
+                        'name' => Type::string(),
+                    ],
+                    'resolve' => function ($rootValue, $args) {
+                        return 'resolved';
+                    }
+                ]
+            ]
+        ]);
+        $fakeSchema = new Schema([
+            'query' => $queryType
+        ]);
 
-        $manager = new Manager();
-        $manager->applyConfig($config);
-        $manager->setMiddlewares([
+        $handler = new QueryHandler();
+        $handler->setMiddlewares([
             new DummyResponseMiddleware(),
         ]);
 
         $this->assertEquals(
-            ['result' => 'It was me, Dio!'],
-            $manager->queryAndReturnResult(
-                '{ query something }',
-                [ 'name' => 'Dio' ]
+            'It was me, Dio!',
+            $handler->queryAndReturnResult(
+                $fakeSchema,
+                'query { myQuery }',
+                ['name' => 'Dio']
             )
         );
     }

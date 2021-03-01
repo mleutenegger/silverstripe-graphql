@@ -1,14 +1,14 @@
-language: php
+version: ~> 1.0
 
-dist: xenial
-
-services:
-  - mysql
-  - postgresql
+import:
+  - silverstripe/silverstripe-travis-shared:config/provision/standard-jobs-fixed-behat.yml
 
 env:
   global:
-    - COMPOSER_ROOT_VERSION=4.x-dev
+    - COMPOSER_ROOT_VERSION="4.x-dev"
+    - REQUIRE_RECIPE="4.x-dev"
+    - REQUIRE_EXTRA="silverstripe/recipe-cms:4.x-dev silverstripe/frameworktest:0.3.0"
+    - BEHAT_SUITE="asset-admin --config vendor/silverstripe/asset-admin/behat.yml"
 
 matrix:
   fast_finish: true
@@ -19,23 +19,22 @@ matrix:
       env: DB=MYSQL PHPUNIT_TEST=1
     - php: 7.3
       env: DB=MYSQL PDO=1 PHPUNIT_COVERAGE_TEST=1
+    - php: 7.4
+      env: DB=MYSQL PHPUNIT_TEST=1
+    - php: 7.3
+      env: DB=MYSQL BEHAT_TEST=1
+    - php: 7.3
+      env: DB=MYSQL ASSETADMIN_TEST=1
+  # TODO https://github.com/silverstripe/silverstripe-asset-admin/issues/1163
+  allow_failures:
+    - php: 7.3
+      env: DB=MYSQL BEHAT_TEST=1
 
 before_script:
-# Init PHP
-  - composer self-update || true
-  - phpenv rehash
-  - phpenv config-rm xdebug.ini
+  # separately create artifacts directory for asset-admin behat test
+  - if [[ $BEHAT_TEST ]]; then mkdir ./vendor/silverstripe/asset-admin/artifacts; fi
 
-# Install composer dependencies
-  - composer validate
-  - composer require --no-update silverstripe/recipe-core:5.x-dev silverstripe/versioned:2.x-dev silverstripe/assets:2.x-dev
-  - composer install --prefer-dist
-  - if [[ $DB == PGSQL ]]; then composer require silverstripe/postgresql:3.x-dev --prefer-dist; fi
+after_failure:
+  # upload artifacts from asset-admin behat test
+  - if [[ $BEHAT_TEST ]]; then php ./vendor/silverstripe/framework/tests/behat/travis-upload-artifacts.php --if-env BEHAT_TEST,ARTIFACTS_BUCKET,ARTIFACTS_KEY,ARTIFACTS_SECRET --target-path $TRAVIS_REPO_SLUG/$TRAVIS_BUILD_ID/$TRAVIS_JOB_ID --artifacts-base-url https://s3.amazonaws.com/$ARTIFACTS_BUCKET/ --artifacts-path ./vendor/silverstripe/asset-admin/artifacts/; fi
 
-script:
-  - if [[ $PHPUNIT_TEST ]]; then vendor/bin/phpunit; fi
-  - if [[ $PHPCS_TEST ]]; then composer run-script lint; fi
-  - if [[ $PHPUNIT_COVERAGE_TEST ]]; then vendor/bin/phpunit --coverage-clover=coverage.xml; fi
-
-after_success:
-  - if [[ $PHPUNIT_COVERAGE_TEST ]]; then bash <(curl -s https://codecov.io/bash) -f coverage.xml; fi

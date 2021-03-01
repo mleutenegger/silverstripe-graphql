@@ -3,32 +3,37 @@
 namespace SilverStripe\GraphQL;
 
 use Exception;
+use InvalidArgumentException;
 use LogicException;
-use SilverStripe\Assets\Storage\GeneratedAssetHandler;
 use SilverStripe\Control\Controller as BaseController;
 use SilverStripe\Control\Director;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Control\HTTPResponse;
 use SilverStripe\Core\Config\Config;
-use SilverStripe\Core\Flushable;
 use SilverStripe\Core\Injector\Injector;
+use SilverStripe\EventDispatcher\Dispatch\Dispatcher;
+use SilverStripe\EventDispatcher\Symfony\Event;
 use SilverStripe\GraphQL\Auth\Handler;
-use SilverStripe\GraphQL\Dev\State\DisableTypeCacheState;
-use SilverStripe\GraphQL\Scaffolding\StaticSchema;
-use SilverStripe\ORM\Connect\DatabaseException;
+use SilverStripe\GraphQL\PersistedQuery\RequestProcessor;
+use SilverStripe\GraphQL\QueryHandler\QueryHandlerInterface;
+use SilverStripe\GraphQL\Schema\Exception\SchemaBuilderException;
+use SilverStripe\GraphQL\QueryHandler\RequestContextProvider;
+use SilverStripe\GraphQL\QueryHandler\SchemaContextProvider;
+use SilverStripe\GraphQL\QueryHandler\TokenContextProvider;
+use SilverStripe\GraphQL\QueryHandler\UserContextProvider;
+use SilverStripe\GraphQL\Schema\Schema;
+use SilverStripe\GraphQL\Schema\SchemaBuilder;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Permission;
 use SilverStripe\Versioned\Versioned;
+use BadMethodCallException;
 
 /**
  * Top level controller for handling graphql requests.
- * @todo CSRF protection (or token-based auth)
  * @skipUpgrade
  */
-class Controller extends BaseController implements Flushable
+class Controller extends BaseController
 {
-    const CACHE_FILENAME = 'types.graphql';
-
     /**
      * Cors default config
      *
@@ -45,46 +50,38 @@ class Controller extends BaseController implements Flushable
     ];
 
     /**
-     * If true, store the fragment JSON in a flat file in assets/
+     * @var string
+     */
+    private $schemaKey;
+
+    /**
+     * @var QueryHandlerInterface
+     */
+    private $queryHandler;
+
+    /**
+     * Override the default cors config per instance
+     * @var array
+     */
+    protected $corsConfig = [];
+
+    /**
      * @var bool
-     * @config
      */
-    private static $cache_types_in_filesystem = false;
+    protected $autobuildSchema = true;
 
     /**
-     * Toggles caching types to the file system on flush
-     * This is set to false in test state @see DisableTypeCacheState
-     *
-     * @var bool
-     * @config
+     * @param string|null $schemaKey
+     * @param QueryHandlerInterface|null $queryHandler
      */
-    private static $cache_on_flush = true;
-
-    /**
-     * @var Manager
-     */
-    protected $manager;
-
-    /**
-     * @var GeneratedAssetHandler
-     */
-    protected $assetHandler;
-
-    /**
-     * @param Manager $manager
-     */
-    public function __construct(Manager $manager = null)
-    {
+    public function __construct(
+        ?string $schemaKey = null,
+        ?QueryHandlerInterface $queryHandler = null
+    ) {
         parent::__construct();
-        $this->manager = $manager;
-
-        if ($this->manager && $this->manager->getSchemaKey()) {
-            // Side effect. This isn't ideal, but having multiple instances of StaticSchema
-            // is a massive architectural change.
-            StaticSchema::reset();
-
-            $this->manager->configure();
-        }
+        $this->setSchemaKey($schemaKey);
+        $handler = $queryHandler ?: Injector::inst()->create(QueryHandlerInterface::class);
+        $this->setQueryHandler($handler);
     }
 
     /**
@@ -92,27 +89,60 @@ class Controller extends BaseController implements Flushable
      *
      * @param HTTPRequest $request
      * @return HTTPResponse
+     * @throws InvalidArgumentException
      */
-    public function index(HTTPRequest $request)
+    public function index(HTTPRequest $request): HTTPResponse
     {
+        if (!$this->schemaKey) {
+            throw new BadMethodCallException('Cannot query the controller without a schema key defined');
+        }
+
         $stage = $request->param('Stage');
-        if ($stage && in_array($stage, [Versioned::DRAFT, Versioned::LIVE])) {
+        if ($stage) {
             Versioned::set_stage($stage);
         }
+
         // Check for a possible CORS preflight request and handle if necessary
-        // Refer issue 66:  https://github.com/silverstripe/silverstripe-graphql/issues/66
         if ($request->httpMethod() === 'OPTIONS') {
             return $this->handleOptions($request);
         }
 
         // Main query handling
         try {
-            $manager = $this->getManager($request);
-            // Parse input
             list($query, $variables) = $this->getRequestQueryVariables($request);
+            if (!$query) {
+                $this->httpError(400, 'This endpoint requires a "query" parameter');
+            }
+            $builder = SchemaBuilder::singleton();
+            $graphqlSchema = $builder->getSchema($this->getSchemaKey());
+            if (!$graphqlSchema && $this->autobuildEnabled()) {
+                // clear the cache on autobuilds until we trust it more. Maybe
+                // make this configurable.
+                $clear = true;
+                $graphqlSchema = $builder->buildByName($this->getSchemaKey(), $clear);
+            } elseif (!$graphqlSchema) {
+                throw new SchemaBuilderException(sprintf(
+                    'Schema %s has not been built.',
+                    $this->getSchemaKey()
+                ));
+            }
+            $handler = $this->getQueryHandler();
+            $this->applyContext($handler);
 
-            // Run query
-            $result = $manager->query($query, $variables);
+            $ctx = $handler->getContext();
+            $eventContext = [
+                'schema' => $graphqlSchema,
+                'query' => $query,
+                'context' => $ctx,
+                'variables' => $variables,
+            ];
+
+            Dispatcher::singleton()->trigger('onGraphQLQuery', Event::create($this->getSchemaKey(), $eventContext));
+
+            $result = $handler->query($graphqlSchema, $query, $variables);
+            $eventContext['result'] = $result;
+
+            Dispatcher::singleton()->trigger('onGraphQLResponse', Event::create($this->getSchemaKey(), $eventContext));
         } catch (Exception $exception) {
             $error = ['message' => $exception->getMessage()];
 
@@ -133,72 +163,38 @@ class Controller extends BaseController implements Flushable
     }
 
     /**
-     * @param HTTPRequest $request
-     * @return Manager
+     * @return bool
      */
-    public function getManager($request = null)
+    public function autobuildEnabled(): bool
     {
-        $manager = null;
-        if (!$request) {
-            $request = $this->getRequest();
-        }
-        if ($this->manager) {
-            $manager = $this->manager;
-        } else {
-            // Get a service rather than an instance (to allow procedural configuration)
-            $config = Config::inst()->get(static::class, 'schema');
-            $manager = Manager::createFromConfig($config);
-        }
-        $this->applyManagerContext($manager, $request);
-        $this->setManager($manager);
-
-        return $manager;
+        return $this->autobuildSchema;
     }
 
     /**
-     * @param Manager $manager
-     * @return $this
+     * @param bool $autobuildSchema
+     * @return Controller
      */
-    public function setManager($manager)
+    public function setAutobuildSchema(bool $autobuildSchema): Controller
     {
-        $this->manager = $manager;
-
+        $this->autobuildSchema = $autobuildSchema;
         return $this;
     }
 
-    /**
-     * @param GeneratedAssetHandler $handler
-     * @return $this
-     */
-    public function setAssetHandler(GeneratedAssetHandler $handler)
-    {
-        $this->assetHandler = $handler;
-
-        return $this;
-    }
-
-    /**
-     * @return GeneratedAssetHandler
-     */
-    public function getAssetHandler()
-    {
-        return $this->assetHandler;
-    }
 
     /**
      * Get an instance of the authorization Handler to manage any authentication requirements
      *
      * @return Handler
      */
-    public function getAuthHandler()
+    public function getAuthHandler(): Handler
     {
         return new Handler;
     }
 
     /**
-     * @return string
+     * @return string|null
      */
-    public function getToken()
+    public function getToken(): ?string
     {
         return $this->getRequest()->getHeader('X-CSRF-TOKEN');
     }
@@ -210,9 +206,9 @@ class Controller extends BaseController implements Flushable
      * @param HTTPResponse $response
      * @return HTTPResponse
      */
-    public function addCorsHeaders(HTTPRequest $request, HTTPResponse $response)
+    public function addCorsHeaders(HTTPRequest $request, HTTPResponse $response): HTTPResponse
     {
-        $corsConfig = Config::inst()->get(static::class, 'cors');
+        $corsConfig = $this->getMergedCorsConfig();
 
         // If CORS is disabled don't add the extra headers. Simply return the response untouched.
         if (empty($corsConfig['Enabled'])) {
@@ -242,13 +238,43 @@ class Controller extends BaseController implements Flushable
     }
 
     /**
+     * @return array
+     */
+    public function getCorsConfig(): array
+    {
+        return $this->corsConfig;
+    }
+
+    /**
+     * @return array
+     */
+    public function getMergedCorsConfig(): array
+    {
+        $defaults = Config::inst()->get(static::class, 'cors');
+        $override = $this->corsConfig;
+
+        return array_merge($defaults, $override);
+    }
+
+    /**
+     * @param array $config
+     * @return $this
+     */
+    public function setCorsConfig(array $config): self
+    {
+        $this->corsConfig = array_merge($this->corsConfig, $config);
+
+        return $this;
+    }
+
+    /**
      * Validate an origin matches a set of allowed origins
      *
      * @param string $origin Origin string
      * @param array $allowedOrigins List of allowed origins
      * @return bool
      */
-    protected function validateOrigin($origin, $allowedOrigins)
+    protected function validateOrigin(string $origin, array $allowedOrigins)
     {
         if (empty($allowedOrigins) || empty($origin)) {
             return false;
@@ -265,26 +291,21 @@ class Controller extends BaseController implements Flushable
     }
 
     /**
-     * @param Manager $manager
-     * @param HTTPRequest $request
+     * @param QueryHandlerInterface $handler
      * @throws Exception
      */
-    protected function applyManagerContext(Manager $manager, HTTPRequest $request)
+    protected function applyContext(QueryHandlerInterface $handler)
     {
-        // Add request context to Manager
-        $manager->addContext('token', $this->getToken());
-        $method = null;
-        if ($request->isGET()) {
-            $method = 'GET';
-        } elseif ($request->isPOST()) {
-            $method = 'POST';
-        }
-        $manager->addContext('httpMethod', $method);
+        $request = $this->getRequest();
+        $user = $this->getRequestUser($request);
+        $token = $this->getToken();
 
-        // Check and validate user for this request
-        $member = $this->getRequestUser($request);
-        if ($member) {
-            $manager->setMember($member);
+        $handler->addContextProvider(UserContextProvider::create($user))
+                ->addContextProvider(TokenContextProvider::create($token ?: ''))
+                ->addContextProvider(RequestContextProvider::create($request));
+        $schemaContext = SchemaBuilder::singleton()->getConfig($this->getSchemaKey());
+        if ($schemaContext) {
+            $handler->addContextProvider(SchemaContextProvider::create($schemaContext));
         }
     }
 
@@ -294,7 +315,7 @@ class Controller extends BaseController implements Flushable
      * @param HTTPRequest $request
      * @return string|null
      */
-    protected function getRequestOrigin(HTTPRequest $request)
+    protected function getRequestOrigin(HTTPRequest $request): ?string
     {
         // Prefer Origin header
         $origin = $request->getHeader('Origin');
@@ -358,19 +379,11 @@ class Controller extends BaseController implements Flushable
             $rawBody = $request->getBody();
             $data = json_decode($rawBody ?: '', true);
             $query = isset($data['query']) ? $data['query'] : null;
-            $id = isset($data['id']) ? $data['id'] : null;
             $variables = isset($data['variables']) ? (array)$data['variables'] : null;
         } else {
-            $query = $request->requestVar('query');
-            $id = $request->requestVar('id');
-            $variables = json_decode($request->requestVar('variables'), true);
-        }
-
-        if ($id) {
-            if ($query) {
-                throw new LogicException('Cannot pass a query when an ID has been specified.');
-            }
-            $query = $this->manager->getQueryFromPersistedID($id);
+            /** @var RequestProcessor $persistedProcessor  */
+            $persistedProcessor = Injector::inst()->get(RequestProcessor::class);
+            list($query, $variables) = $persistedProcessor->getRequestQueryVariables($request);
         }
 
         return [$query, $variables];
@@ -380,13 +393,13 @@ class Controller extends BaseController implements Flushable
      * Get user and validate for this request
      *
      * @param HTTPRequest $request
-     * @return Member
+     * @return Member|null
      * @throws Exception
      */
-    protected function getRequestUser(HTTPRequest $request)
+    protected function getRequestUser(HTTPRequest $request): ?Member
     {
         // Check authentication
-        $member = $this->getAuthHandler()->requireAuthentication($request);
+        $member = $this->getAuthHandler()->requireAuthentication($request) ?: null;
 
         // Check authorisation
         $permissions = $request->param('Permissions');
@@ -408,96 +421,39 @@ class Controller extends BaseController implements Flushable
     }
 
     /**
-     * Introspect the schema and persist it to the filesystem
-     * @throws Exception
+     * @param string $schemaKey
+     * @return $this
      */
-    public function writeSchemaToFilesystem()
+    public function setSchemaKey(string $schemaKey): self
     {
-        $manager = $this->getManager();
-        try {
-            $types = StaticSchema::inst()->introspectTypes($manager);
-        } catch (Exception $e) {
-            throw new Exception(sprintf(
-                'There was an error caching the GraphQL types: %s',
-                $e->getMessage()
-            ));
-        }
+        $this->schemaKey = $schemaKey;
 
-        $this->writeTypes(json_encode($types));
-    }
-
-    public function removeSchemaFromFilesystem()
-    {
-        if (!$this->getAssetHandler()) {
-            return;
-        }
-
-        $this->getAssetHandler()->removeContent($this->generateCacheFilename());
+        return $this;
     }
 
     /**
-     * @param string $content
+     * @return string|null
      */
-    public function writeTypes($content)
+    public function getSchemaKey(): ?string
     {
-        if (!$this->getAssetHandler()) {
-            return;
-        }
-        $this->getAssetHandler()->setContent($this->generateCacheFilename(), $content);
+        return $this->schemaKey;
     }
 
     /**
-     * Write the types json to a flat file, if silverstripe/assets is available
+     * @return QueryHandlerInterface
      */
-    public function processTypeCaching()
+    public function getQueryHandler(): QueryHandlerInterface
     {
-        if ($this->config()->cache_types_in_filesystem) {
-            $this->writeSchemaToFilesystem();
-        } else {
-            $this->removeSchemaFromFilesystem();
-        }
-    }
-
-    public static function flush()
-    {
-        if (!self::config()->get('cache_on_flush')) {
-            return;
-        }
-
-        // This is a bit of a hack to find all registered GraphQL servers. Depends on them
-        // being routed through Director.
-        $routes = Director::config()->get('rules');
-        foreach ($routes as $pattern => $controllerInfo) {
-            $routeClass = (is_string($controllerInfo)) ? $controllerInfo : $controllerInfo['Controller'];
-            if (stristr($routeClass, Controller::class) !== false) {
-                try {
-                    $inst = Injector::inst()->convertServiceProperty($routeClass);
-                    if ($inst instanceof Controller) {
-                        /* @var Controller $inst */
-                        $inst->processTypeCaching();
-                    }
-                } catch (DatabaseException $e) {
-                    // Allow failures on table doesn't exist or no database selected as we're flushing in first DB build
-                    $messageByLine = explode(PHP_EOL, $e->getMessage());
-
-                    // Get the last line
-                    $last = array_pop($messageByLine);
-
-                    if (strpos($last, 'No database selected') === false
-                        && !preg_match('/\s*(table|relation) .* does(n\'t| not) exist/i', $last)
-                    ) {
-                        throw $e;
-                    }
-                }
-            }
-        }
+        return $this->queryHandler;
     }
 
     /**
-     * @return string
+     * @param QueryHandlerInterface $queryHandler
+     * @return Controller
      */
-    protected function generateCacheFilename()
+    public function setQueryHandler(QueryHandlerInterface $queryHandler): self
     {
-        return $this->getManager()->getSchemaKey() . '.' . self::CACHE_FILENAME;
+        $this->queryHandler = $queryHandler;
+        return $this;
     }
 }

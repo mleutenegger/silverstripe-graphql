@@ -1,0 +1,11 @@
+---
+Name: silverstripe-graphql-dataobject
+---
+SilverStripe\ORM\DataObject:
+  graphql_blacklisted_fields:
+    ClassName: true
+    LinkTracking: true
+    FileTracking: true
+  extensions:
+    - SilverStripe\GraphQL\Extensions\DevBuildExtension
+

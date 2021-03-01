@@ -7,6 +7,7 @@ use GraphQL\Type\Definition\Type;
 use GraphQL\Type\Schema;
 use SilverStripe\Dev\SapphireTest;
 use SilverStripe\GraphQL\Middleware\QueryMiddleware;
+use SilverStripe\GraphQL\Schema\Schema as SchemaSchema;
 
 abstract class MiddlewareProcessTestBase extends SapphireTest
 {
@@ -15,7 +16,7 @@ abstract class MiddlewareProcessTestBase extends SapphireTest
      */
     protected $defaultCallback;
 
-    protected function setUp() : void
+    protected function setUp()
     {
         parent::setUp();
         $this->defaultCallback = function () {
@@ -26,13 +27,13 @@ abstract class MiddlewareProcessTestBase extends SapphireTest
         QueryMiddleware $middleware,
         $query,
         $context = [],
-        $params = [],
+        $vars = [],
         $cb = null
     ) {
         if (!$cb) {
             $cb = $this->defaultCallback;
         }
-        return $middleware->process($this->createFakeSchema(), $query, $context, $params, $cb);
+        return $middleware->process($this->createFakeSchema(), $query, $context, $vars, $cb);
     }
 
     protected function createFakeSchema()
@@ -40,7 +41,7 @@ abstract class MiddlewareProcessTestBase extends SapphireTest
         return new Schema([
             'query' => new ObjectType([
                 'name' => 'test',
-                'fields' => [ ['type' => Type::string(), 'name' => 'test'] ]
+                'fields' => [['type' => Type::string(), 'name' => 'test']]
             ])
         ]);
     }

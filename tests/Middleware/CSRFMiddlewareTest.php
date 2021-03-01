@@ -23,7 +23,7 @@ class CSRFMiddlewareTest extends MiddlewareProcessTestBase
     public function testItThrowsIfNoTokenIsProvided()
     {
         $this->expectException(Exception::class);
-        $this->expectExceptionMessageMatches('/must provide a CSRF token/');
+        $this->expectExceptionMessageRegExp('/must provide a CSRF token/');
         $result = $this->simulateMiddlewareProcess(
             new CSRFMiddleware(),
             ' mutation someMutation { tester }'
@@ -69,7 +69,7 @@ GRAPHQL;
     public function testItThrowsIfTokenIsInvalid()
     {
         $this->expectException(Exception::class);
-        $this->expectExceptionMessageMatches('/Invalid CSRF token/');
+        $this->expectExceptionMessageRegExp('/Invalid CSRF token/');
         $result = $this->simulateMiddlewareProcess(
             new CSRFMiddleware(),
             ' mutation someMutation { tester }',
